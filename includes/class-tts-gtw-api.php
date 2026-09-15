@@ -116,17 +116,89 @@ class TTS_GTW_API {
 		}
 
 		$auth = $this->auth_from_token( $token, array() );
+		$auth['scope'] = isset( $token['scope'] ) && is_scalar( $token['scope'] ) ? (string) $token['scope'] : '';
 
+		self::log( 'Token response keys: ' . implode( ', ', array_keys( $token ) ) . ( $auth['scope'] ? ' | scope: ' . $auth['scope'] : '' ) );
+
+		// Current GoTo OAuth clients return only tokens; the organizer key has
+		// to be looked up from the identity endpoints. Legacy clients include
+		// organizer_key in the token response.
 		if ( empty( $auth['organizer_key'] ) ) {
-			return new WP_Error(
-				'tts_gtw_no_organizer',
-				__( 'GoTo did not return an organizer key. Make sure the OAuth client has access to the GoTo Webinar product and the account you signed in with is a webinar organizer.', 'twoten-goto-webinar-gravityforms' )
-			);
+			$identity = $this->lookup_identity( $auth['access_token'] );
+			if ( is_wp_error( $identity ) ) {
+				return $identity;
+			}
+			$auth = array_merge( $auth, $identity );
 		}
 
 		self::save_auth( $auth );
 
 		return $auth;
+	}
+
+	/**
+	 * Resolve the organizer/account keys for the signed-in user.
+	 *
+	 * Tries the admin "me" endpoint first (returns key + accountKey), then the
+	 * SCIM identity endpoint (id = user key = organizer key).
+	 *
+	 * @param string $access_token Fresh access token.
+	 * @return array|WP_Error Subset of connection data.
+	 */
+	private function lookup_identity( $access_token ) {
+		$errors = array();
+
+		$me = $this->http( 'GET', self::API_BASE . '/admin/rest/v1/me', $access_token );
+		if ( ! is_wp_error( $me ) && ! empty( $me['key'] ) ) {
+			self::log( 'Organizer key resolved via admin/rest/v1/me.' );
+			return array_filter(
+				array(
+					'organizer_key' => (string) $me['key'],
+					'account_key'   => isset( $me['accountKey'] ) ? (string) $me['accountKey'] : '',
+					'email'         => isset( $me['email'] ) ? (string) $me['email'] : '',
+					'firstName'     => isset( $me['firstName'] ) ? (string) $me['firstName'] : '',
+					'lastName'      => isset( $me['lastName'] ) ? (string) $me['lastName'] : '',
+				)
+			);
+		}
+		$errors[] = 'admin/rest/v1/me: ' . ( is_wp_error( $me ) ? $me->get_error_message() : 'no key in response (' . implode( ',', array_keys( (array) $me ) ) . ')' );
+
+		$me = $this->http( 'GET', self::API_BASE . '/identity/v1/Users/me', $access_token );
+		if ( ! is_wp_error( $me ) && ! empty( $me['id'] ) ) {
+			self::log( 'Organizer key resolved via identity/v1/Users/me.' );
+			$email = '';
+			if ( ! empty( $me['emails'] ) && is_array( $me['emails'] ) ) {
+				foreach ( $me['emails'] as $entry ) {
+					if ( is_array( $entry ) && ! empty( $entry['value'] ) ) {
+						$email = (string) $entry['value'];
+						if ( ! empty( $entry['primary'] ) ) {
+							break;
+						}
+					}
+				}
+			}
+			return array_filter(
+				array(
+					'organizer_key' => (string) $me['id'],
+					'account_key'   => isset( $me['accountKey'] ) ? (string) $me['accountKey'] : '',
+					'email'         => $email ? $email : ( isset( $me['userName'] ) ? (string) $me['userName'] : '' ),
+					'firstName'     => isset( $me['name']['givenName'] ) ? (string) $me['name']['givenName'] : '',
+					'lastName'      => isset( $me['name']['familyName'] ) ? (string) $me['name']['familyName'] : '',
+				)
+			);
+		}
+		$errors[] = 'identity/v1/Users/me: ' . ( is_wp_error( $me ) ? $me->get_error_message() : 'no id in response (' . implode( ',', array_keys( (array) $me ) ) . ')' );
+
+		self::log( 'Organizer key lookup failed. ' . implode( ' | ', $errors ) );
+
+		return new WP_Error(
+			'tts_gtw_no_organizer',
+			sprintf(
+				/* translators: %s: technical detail */
+				__( 'Signed in to GoTo, but could not determine the organizer key. Check that the OAuth client has the GoTo Webinar and identity scopes enabled and that you signed in as the webinar organizer. Detail: %s', 'twoten-goto-webinar-gravityforms' ),
+				implode( ' | ', $errors )
+			)
+		);
 	}
 
 	/**
@@ -274,6 +346,31 @@ class TTS_GTW_API {
 			$url = add_query_arg( $query, $url );
 		}
 
+		$data = $this->http( $method, $url, $token, $body );
+
+		if ( is_wp_error( $data ) && $retry ) {
+			$error_data = $data->get_error_data();
+			if ( is_array( $error_data ) && 401 === (int) ( isset( $error_data['status'] ) ? $error_data['status'] : 0 ) ) {
+				$refreshed = $this->refresh_token();
+				if ( ! is_wp_error( $refreshed ) ) {
+					return $this->request( $method, $path, $body, $query, false );
+				}
+			}
+		}
+
+		return $data;
+	}
+
+	/**
+	 * Perform one bearer-authenticated JSON request.
+	 *
+	 * @param string     $method HTTP method.
+	 * @param string     $url    Absolute URL.
+	 * @param string     $token  Access token.
+	 * @param array|null $body   JSON body, or null.
+	 * @return array|WP_Error Decoded response (empty array for empty bodies).
+	 */
+	private function http( $method, $url, $token, $body = null ) {
 		$args = array(
 			'method'  => $method,
 			'timeout' => 20,
@@ -289,18 +386,14 @@ class TTS_GTW_API {
 
 		$response = wp_remote_request( $url, $args );
 		if ( is_wp_error( $response ) ) {
+			self::log( $method . ' ' . $url . ' failed: ' . $response->get_error_message() );
 			return $response;
 		}
 
 		$code = (int) wp_remote_retrieve_response_code( $response );
 		$data = self::decode( wp_remote_retrieve_body( $response ) );
 
-		if ( 401 === $code && $retry ) {
-			$refreshed = $this->refresh_token();
-			if ( ! is_wp_error( $refreshed ) ) {
-				return $this->request( $method, $path, $body, $query, false );
-			}
-		}
+		self::log( $method . ' ' . preg_replace( '/\?.*/', '', $url ) . ' -> HTTP ' . $code );
 
 		if ( $code < 200 || $code >= 300 ) {
 			return new WP_Error(
@@ -431,6 +524,17 @@ class TTS_GTW_API {
 	}
 
 	/* ── Helpers ───────────────────────────────────────────────────────── */
+
+	/**
+	 * Write to the Gravity Forms log for this add-on when available.
+	 *
+	 * @param string $message Message.
+	 */
+	public static function log( $message ) {
+		if ( function_exists( 'tts_gtw' ) && tts_gtw() ) {
+			tts_gtw()->log_debug( 'TTS_GTW_API: ' . $message );
+		}
+	}
 
 	/**
 	 * Decode JSON keeping GoTo's 64-bit keys as strings.

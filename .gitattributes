@@ -1,0 +1,5 @@
+# Keep development files out of GitHub archives / release ZIPs.
+.github        export-ignore
+.gitignore     export-ignore
+.gitattributes export-ignore
+.editorconfig  export-ignore

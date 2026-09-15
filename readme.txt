@@ -4,7 +4,7 @@ Tags: gravity forms, goto webinar, gotowebinar, webinar, registration
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -24,6 +24,11 @@ The plugin updates itself from GitHub releases and has a "Check for updates" but
 4. Add a GoTo Webinar feed to a form.
 
 == Changelog ==
+
+= 1.0.1 =
+* Resolve the organizer key via GoTo identity endpoints (current OAuth clients no longer return it with the token).
+* Multiple-choice answers match tolerantly (dashes, quotes, case, punctuation); unmatched answers are recorded as an entry note.
+* Daily token keep-alive so the connection survives quiet periods.
 
 = 1.0.0 =
 * Initial release.

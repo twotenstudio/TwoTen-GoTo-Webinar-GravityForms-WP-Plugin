@@ -3,7 +3,7 @@
  * Plugin Name:       TwoTen GoTo Webinar for Gravity Forms
  * Plugin URI:        https://github.com/twotenstudio/TwoTen-GoTo-Webinar-GravityForms-WP-Plugin
  * Description:       Registers Gravity Forms submissions as GoTo Webinar registrants. Feed-based, with OAuth connection, field mapping, custom questions and conditional logic.
- * Version:           1.0.0
+ * Version:           1.0.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Requires Plugins:  gravityforms
@@ -17,7 +17,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'TTS_GTW_VERSION', '1.0.0' );
+define( 'TTS_GTW_VERSION', '1.0.1' );
 define( 'TTS_GTW_FILE', __FILE__ );
 define( 'TTS_GTW_DIR', plugin_dir_path( __FILE__ ) );
 define( 'TTS_GTW_URL', plugin_dir_url( __FILE__ ) );
@@ -47,6 +47,11 @@ function tts_gtw_load_addon() {
 	require_once TTS_GTW_DIR . 'includes/class-gf-goto-webinar.php';
 
 	GFAddOn::register( 'GF_GoTo_Webinar' );
+}
+
+register_deactivation_hook( __FILE__, 'tts_gtw_deactivate' );
+function tts_gtw_deactivate() {
+	wp_clear_scheduled_hook( 'tts_gtw_keepalive' );
 }
 
 /**

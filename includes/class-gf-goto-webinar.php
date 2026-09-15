@@ -29,6 +29,7 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 	const FIELDS_CACHE   = 'tts_gtw_fields';
 	const CACHE_TTL      = 10 * MINUTE_IN_SECONDS;
 	const STATE_TTL      = 15 * MINUTE_IN_SECONDS;
+	const KEEPALIVE_HOOK = 'tts_gtw_keepalive';
 
 	/** @var GF_GoTo_Webinar|null */
 	private static $_instance = null;
@@ -54,6 +55,10 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 		parent::init();
 
 		add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
+		add_action( self::KEEPALIVE_HOOK, array( $this, 'keepalive' ) );
+		if ( TTS_GTW_API::is_connected() && ! wp_next_scheduled( self::KEEPALIVE_HOOK ) ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'daily', self::KEEPALIVE_HOOK );
+		}
 		add_filter( 'gform_replace_merge_tags', array( $this, 'replace_merge_tags' ), 10, 7 );
 	}
 
@@ -73,6 +78,24 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 		parent::uninstall();
 		TTS_GTW_API::clear_auth();
 		$this->clear_caches();
+		wp_clear_scheduled_hook( self::KEEPALIVE_HOOK );
+	}
+
+	/**
+	 * Daily cron: refresh the access token so the refresh token (which GoTo
+	 * expires after 30 days without use) stays valid on quiet sites.
+	 */
+	public function keepalive() {
+		$api = $this->get_api();
+		if ( ! $api ) {
+			return;
+		}
+		$result = $api->refresh_token();
+		if ( is_wp_error( $result ) ) {
+			$this->log_error( __METHOD__ . '(): ' . $result->get_error_message() );
+		} else {
+			$this->log_debug( __METHOD__ . '(): Token refreshed.' );
+		}
 	}
 
 	/* ── API access ────────────────────────────────────────────────────── */
@@ -341,6 +364,7 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 				check_admin_referer( 'tts_gtw_disconnect' );
 				TTS_GTW_API::clear_auth();
 				$this->clear_caches();
+				wp_clear_scheduled_hook( self::KEEPALIVE_HOOK );
 				$this->log_debug( __METHOD__ . '(): Disconnected from GoTo Webinar.' );
 				$this->redirect_to_settings( 'disconnected' );
 				break;
@@ -859,7 +883,24 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 			if ( $question && 'multipleChoice' === rgar( $question, 'type' ) ) {
 				$answer_key = $this->match_answer_key( $question, $value );
 				if ( null === $answer_key ) {
-					$this->log_debug( __METHOD__ . "(): No answer option matches '{$value}' for question {$question_key}; skipping." );
+					$options = array();
+					foreach ( (array) rgar( $question, 'answers' ) as $answer ) {
+						if ( isset( $answer['answer'] ) ) {
+							$options[] = (string) $answer['answer'];
+						}
+					}
+					$this->log_error( __METHOD__ . "(): No answer option matches '{$value}' for question {$question_key}; skipping. Options: " . implode( ' | ', $options ) );
+					$this->add_note(
+						$entry['id'],
+						sprintf(
+							/* translators: 1: submitted value, 2: question text, 3: list of valid options */
+							esc_html__( 'GoTo Webinar: the answer "%1$s" was not sent for the question "%2$s" because it does not match any of the webinar\'s answer options: %3$s. Make the form choice text match one of these (or set the choice value to the GoTo answer key).', 'twoten-goto-webinar-gravityforms' ),
+							$value,
+							rgar( $question, 'question', $question_key ),
+							implode( ' | ', $options )
+						),
+						'error'
+					);
 					continue;
 				}
 				$responses[] = array(
@@ -975,19 +1016,70 @@ class GF_GoTo_Webinar extends GFFeedAddOn {
 	 * @return string|null
 	 */
 	private function match_answer_key( array $question, $value ) {
-		$needle = mb_strtolower( trim( (string) $value ) );
-		foreach ( (array) rgar( $question, 'answers' ) as $answer ) {
-			if ( ! isset( $answer['answerKey'] ) ) {
-				continue;
-			}
-			if ( (string) $answer['answerKey'] === (string) $value ) {
-				return (string) $answer['answerKey'];
-			}
-			if ( isset( $answer['answer'] ) && mb_strtolower( trim( (string) $answer['answer'] ) ) === $needle ) {
+		$answers = (array) rgar( $question, 'answers' );
+		$value   = trim( (string) $value );
+
+		// 1. Exact answer key (lets a form choice's value be the GoTo answerKey).
+		foreach ( $answers as $answer ) {
+			if ( isset( $answer['answerKey'] ) && (string) $answer['answerKey'] === $value ) {
 				return (string) $answer['answerKey'];
 			}
 		}
+
+		// 2. Normalised text comparison (case, dashes, quotes, whitespace, punctuation).
+		$needle = $this->normalise_text( $value );
+		if ( '' === $needle ) {
+			return null;
+		}
+		foreach ( $answers as $answer ) {
+			if ( isset( $answer['answerKey'], $answer['answer'] ) && $this->normalise_text( $answer['answer'] ) === $needle ) {
+				return (string) $answer['answerKey'];
+			}
+		}
+
+		// 3. Close match (e.g. a trailing word differs) when it is unambiguous.
+		$best_key   = null;
+		$best_score = 0;
+		$runner_up  = 0;
+		foreach ( $answers as $answer ) {
+			if ( ! isset( $answer['answerKey'], $answer['answer'] ) ) {
+				continue;
+			}
+			similar_text( $needle, $this->normalise_text( $answer['answer'] ), $percent );
+			if ( $percent > $best_score ) {
+				$runner_up  = $best_score;
+				$best_score = $percent;
+				$best_key   = (string) $answer['answerKey'];
+			} elseif ( $percent > $runner_up ) {
+				$runner_up = $percent;
+			}
+		}
+		if ( null !== $best_key && $best_score >= 90 && $best_score - $runner_up >= 10 ) {
+			return $best_key;
+		}
+
 		return null;
+	}
+
+	/**
+	 * Reduce text to a comparable form: lower-case ASCII letters/digits with
+	 * single spaces, so "0–3 months" and "0 -3 Months" compare equal.
+	 *
+	 * @param string $text Text.
+	 * @return string
+	 */
+	private function normalise_text( $text ) {
+		$text = (string) $text;
+		$text = str_replace(
+			array( "\xE2\x80\x93", "\xE2\x80\x94", "\xE2\x80\x98", "\xE2\x80\x99", "\xE2\x80\x9C", "\xE2\x80\x9D", "\xC2\xA0" ),
+			array( '-', '-', "'", "'", '"', '"', ' ' ),
+			$text
+		);
+		$text = html_entity_decode( $text, ENT_QUOTES, 'UTF-8' );
+		$text = function_exists( 'mb_strtolower' ) ? mb_strtolower( $text, 'UTF-8' ) : strtolower( $text );
+		$text = remove_accents( $text );
+		$text = preg_replace( '/[^a-z0-9]+/', ' ', $text );
+		return trim( preg_replace( '/\s+/', ' ', $text ) );
 	}
 
 	/**
